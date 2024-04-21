@@ -55,7 +55,6 @@ type EvrPipeline struct {
 	streamManager        StreamManager
 	metrics              Metrics
 	runtime              *Runtime
-	evrRuntime           *EvrRuntime
 	runtimeModule        *RuntimeGoNakamaModule
 	runtimeLogger        runtime.Logger
 
@@ -75,7 +74,7 @@ type EvrPipeline struct {
 
 type ctxDiscordBotTokenKey struct{}
 
-func NewEvrPipeline(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, storageIndex StorageIndex, leaderboardScheduler LeaderboardScheduler, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, pipeline *Pipeline, runtime *Runtime, evrRuntime *EvrRuntime) *EvrPipeline {
+func NewEvrPipeline(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, storageIndex StorageIndex, leaderboardScheduler LeaderboardScheduler, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, pipeline *Pipeline, runtime *Runtime) *EvrPipeline {
 	// The Evr pipeline is going to be a bit "different".
 	// It's going to get access to most components, because
 	// of the way EVR works, it's going to need to be able
@@ -161,7 +160,6 @@ func NewEvrPipeline(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 		streamManager:        streamManager,
 		metrics:              metrics,
 		runtime:              runtime,
-		evrRuntime:           evrRuntime,
 		runtimeModule:        nk,
 		runtimeLogger:        runtimeLogger,
 
@@ -188,7 +186,7 @@ func NewEvrPipeline(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 
 	// Create a timer to periodically clear the backfill queue
 	go func() {
-		interval := 5 * time.Minute
+		interval := 3 * time.Minute
 		ticker := time.NewTicker(interval)
 		for {
 			select {
@@ -201,6 +199,38 @@ func NewEvrPipeline(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 					if value.TryLock() {
 						evrPipeline.backfillQueue.Delete(key)
 						value.Unlock()
+					}
+					return true
+				})
+
+				evrPipeline.broadcasterRegistrationBySession.Range(func(key string, value *MatchBroadcaster) bool {
+					if sessionRegistry.Get(uuid.FromStringOrNil(value.SessionID)) == nil {
+						logger.Debug("Housekeeping: Session not found for broadcaster", zap.String("sessionID", value.SessionID))
+						evrPipeline.broadcasterRegistrationBySession.Delete(key)
+					}
+					return true
+				})
+
+				evrPipeline.loginSessionByEvrID.Range(func(key string, value *sessionWS) bool {
+					if sessionRegistry.Get(value.ID()) == nil {
+						logger.Debug("Housekeeping: Session not found for evrID", zap.String("evrID", key))
+						evrPipeline.loginSessionByEvrID.Delete(key)
+					}
+					return true
+				})
+
+				evrPipeline.matchBySessionID.Range(func(key string, value string) bool {
+					if sessionRegistry.Get(uuid.FromStringOrNil(key)) == nil {
+						logger.Debug("Housekeeping: Session not found for matchID", zap.String("matchID", value))
+						evrPipeline.matchBySessionID.Delete(key)
+					}
+					return true
+				})
+
+				evrPipeline.matchByEvrID.Range(func(key string, value string) bool {
+					if match, _, _ := matchRegistry.GetMatch(ctx, value); match == nil {
+						logger.Debug("Housekeeping: Match not found for evrID", zap.String("evrID", key), zap.String("matchID", value))
+						evrPipeline.matchByEvrID.Delete(key)
 					}
 					return true
 				})
@@ -255,8 +285,8 @@ func (p *EvrPipeline) ProcessRequestEvr(logger *zap.Logger, session *sessionWS, 
 		pipelineFn = p.loggedInUserProfileRequest
 	case *evr.ChannelInfoRequest:
 		pipelineFn = p.channelInfoRequest
-	case *evr.UpdateProfile:
-		pipelineFn = p.updateProfile
+	case *evr.UpdateClientProfile:
+		pipelineFn = p.updateClientProfileRequest
 	case *evr.OtherUserProfileRequest: // Broadcaster only via it's login connection
 		pipelineFn = p.otherUserProfileRequest
 	case *evr.UserServerProfileUpdateRequest: // Broadcaster only via it's login connection
@@ -370,14 +400,6 @@ func ProcessOutgoing(logger *zap.Logger, session *sessionWS, in *rtapi.Envelope)
 				// This is not this user
 				continue
 			}
-			if _, ok := p.broadcasterRegistrationBySession.Load(session.ID().String()); !ok {
-				// This is a player connection
-				if evrId, ok := session.Context().Value(ctxEvrIDKey{}).(evr.EvrId); ok {
-					p.matchByEvrID.Delete(evrId.Token())
-				}
-			}
-
-			p.matchBySessionID.Delete(session.ID().String())
 		}
 
 		for _, join := range envelope.GetJoins() {
@@ -394,6 +416,18 @@ func ProcessOutgoing(logger *zap.Logger, session *sessionWS, in *rtapi.Envelope)
 					p.matchByEvrID.Store(evrId.Token(), matchID)
 				}
 			}
+
+			go func() {
+				// Remove the match lookup entries when the session is closed.
+				<-session.Context().Done()
+				if _, isBroadcaster := p.broadcasterRegistrationBySession.Load(session.ID().String()); !isBroadcaster {
+					// This is a player connection
+					if evrId, ok := session.Context().Value(ctxEvrIDKey{}).(evr.EvrId); ok {
+						p.matchByEvrID.Delete(evrId.Token())
+					}
+				}
+				p.matchBySessionID.Delete(session.ID().String())
+			}()
 		}
 
 		pipelineFn = func(_ *zap.Logger, _ *sessionWS, _ *rtapi.Envelope) ([]evr.Message, error) {

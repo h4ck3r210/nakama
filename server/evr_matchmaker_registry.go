@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -162,6 +163,15 @@ type MatchmakingSession struct {
 	Tickets       map[string]TicketMeta // map[ticketId]TicketMeta
 	Party         *PartyHandler
 	LatencyCache  *LatencyCache
+}
+
+func (s *MatchmakingSession) metricsTags() map[string]string {
+	return map[string]string{
+		"type":  s.Label.LobbyType.String(),
+		"mode":  s.Label.Mode.String(),
+		"level": s.Label.Level.String(),
+		"team":  strconv.FormatInt(int64(s.Label.TeamIndex), 10),
+	}
 }
 
 // Cancel cancels the matchmaking session with a given reason, and returns the reason.
@@ -331,15 +341,15 @@ func NewMatchmakingRegistry(logger *zap.Logger, matchRegistry MatchRegistry, mat
 }
 
 type MatchmakingSettings struct {
-	MinCount             int      `json:"min_count"`             // Minimum number of matches to create
-	MaxCount             int      `json:"max_count"`             // Maximum number of matches to create
-	CountMultiple        int      `json:"count_multiple"`        // Count multiple of the party size
-	QueryAddon           string   `json:"query_addon"`           // Additional query to add to the matchmaking query
-	GroupID              string   `json:"group_id"`              // Group ID to matchmake with
-	PriorityPlayers      []string `json:"priority_players"`      // Prioritize these players
-	PriorityBroadcasters []string `json:"priority_broadcasters"` // Prioritize these broadcasters
-	DisableBackfill      bool     `json:"disable_backfill"`      // Backfill matches
-	NextMatchID          string   `json:"next_match_id"`         // Try to join this match immediately when finding a match
+	MinCount             int        `json:"min_count"`             // Minimum number of matches to create
+	MaxCount             int        `json:"max_count"`             // Maximum number of matches to create
+	CountMultiple        int        `json:"count_multiple"`        // Count multiple of the party size
+	QueryAddon           string     `json:"query_addon"`           // Additional query to add to the matchmaking query
+	GroupID              string     `json:"group_id"`              // Group ID to matchmake with
+	PriorityPlayers      []string   `json:"priority_players"`      // Prioritize these players
+	PriorityBroadcasters []string   `json:"priority_broadcasters"` // Prioritize these broadcasters
+	DisableBackfill      bool       `json:"disable_backfill"`      // Backfill matches
+	NextMatchToken       MatchToken `json:"next_match_id"`         // Try to join this match immediately when finding a match
 }
 
 func (r *MatchmakingRegistry) LoadMatchmakingSettings(ctx context.Context, userID string) (config MatchmakingSettings, err error) {
@@ -404,7 +414,7 @@ func keyToIP(key string) net.IP {
 
 func (mr *MatchmakingRegistry) matchedEntriesFn(entries [][]*MatchmakerEntry) {
 	// Get the matchmaking config from the storage
-	config, err := mr.LoadMatchmakingSettings(mr.ctx, SystemUserId)
+	config, err := mr.LoadMatchmakingSettings(mr.ctx, SystemUserID)
 	if err != nil {
 		mr.logger.Error("Failed to load matchmaking config", zap.Error(err))
 		return
@@ -506,7 +516,14 @@ func (mr *MatchmakingRegistry) buildMatch(entrants []*MatchmakerEntry, config Ma
 			ml.Players = append(ml.Players, pi)
 		}
 	}
-
+	metricsTags := map[string]string{
+		"type":     strconv.FormatInt(int64(ml.LobbyType), 10),
+		"mode":     ml.Mode.String(),
+		"channel":  ml.Channel.String(),
+		"level":    ml.Level.String(),
+		"team_idx": strconv.FormatInt(int64(ml.TeamIndex), 10),
+	}
+	mr.metrics.CustomCounter("matchmaking_matched_participant", metricsTags, int64(len(entrants)))
 	// Find a valid participant to get the label from
 
 	ml.SpawnedBy = uuid.Nil.String()
@@ -674,9 +691,14 @@ func (mr *MatchmakingRegistry) allocateBroadcaster(channel uuid.UUID, config Mat
 		break
 	}
 	// Found a match
-	label.SpawnedBy = SystemUserId
+	label.SpawnedBy = SystemUserID
+	// Instruct the server to prepare the level
+	response, err := SignalMatch(mr.ctx, mr.matchRegistry, matchID, SignalPrepareSession, label)
+	if err != nil {
+		return "", fmt.Errorf("error signaling match: %s: %v", response, err)
+	}
 	// Instruct the server to load the level
-	response, err := SignalMatch(mr.ctx, mr.matchRegistry, matchID, SignalStartSession, label)
+	response, err = SignalMatch(mr.ctx, mr.matchRegistry, matchID, SignalStartSession, label)
 	if err != nil {
 		return "", fmt.Errorf("error signaling match: %s: %v", response, err)
 	}

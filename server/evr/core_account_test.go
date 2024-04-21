@@ -7,9 +7,11 @@
 package evr
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 )
 
 func TestGUID_UnmarshalBytes(t *testing.T) {
@@ -91,6 +93,110 @@ func TestGUID_MarshalJSON(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got, _ := tt.g.MarshalJSON(); string(got) != tt.want {
 				t.Errorf("GUID.JSON() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeveloperFeatures_Omitted_When_Empty(t *testing.T) {
+
+	type testProfile struct {
+		BeforeDev         string            `json:"before_dev,omitempty"`
+		DeveloperFeatures DeveloperFeatures `json:"dev,omitempty"`
+		AfterDev          string            `json:"after_dev,omitempty"`
+	}
+
+	profile := testProfile{
+		BeforeDev: "before",
+		DeveloperFeatures: DeveloperFeatures{
+			DisableAfkTimeout: false,
+			EvrIDOverride: EvrId{
+				PlatformCode: 0,
+				AccountId:    0,
+			},
+		},
+		AfterDev: "after",
+	}
+
+	got, err := json.Marshal(profile)
+	if err != nil {
+		t.Errorf("DeveloperFeatures.MarshalJSON() error = %v", err)
+		return
+	}
+
+	want := `{"before_dev":"before","after_dev":"after"}`
+	var wantErr error = nil
+	if err != wantErr {
+		t.Errorf("DeveloperFeatures.MarshalJSON() error = %v, wantErr %v", err, wantErr)
+		return
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("DeveloperFeatures.MarshalJSON() = `%v`, want `%v`", string(got), string(want))
+	}
+
+}
+
+func TestDeveloperFeatures_MarshalJSON(t *testing.T) {
+	type fields struct {
+		DisableAfkTimeout bool
+		EvrIDOverride     EvrId
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		want    []byte
+		wantErr bool
+	}{
+		{
+			name: "valid DeveloperFeatures",
+			fields: fields{
+				DisableAfkTimeout: false,
+				EvrIDOverride: EvrId{
+					PlatformCode: 0,
+					AccountId:    0,
+				},
+			},
+			want:    []byte(`null`),
+			wantErr: false,
+		},
+		{
+			name: "valid DeveloperFeatures with afk timeout disabled",
+			fields: fields{
+				DisableAfkTimeout: true,
+				EvrIDOverride: EvrId{
+					PlatformCode: 0,
+					AccountId:    0,
+				},
+			},
+			want:    []byte(`{"disable_afk_timeout":true}`),
+			wantErr: false,
+		},
+		{
+			name: "valid DeveloperFeatures with afk timeout disabled and an evr id",
+			fields: fields{
+				DisableAfkTimeout: true,
+				EvrIDOverride: EvrId{
+					PlatformCode: 1,
+					AccountId:    2,
+				},
+			},
+			want:    []byte(`{"disable_afk_timeout":true,"xplatformid":"STM-2"}`),
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &DeveloperFeatures{
+				DisableAfkTimeout: tt.fields.DisableAfkTimeout,
+				EvrIDOverride:     tt.fields.EvrIDOverride,
+			}
+			got, err := f.MarshalJSON()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("DeveloperFeatures.MarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("DeveloperFeatures.MarshalJSON() = `%v`, want `%v`", string(got), string(tt.want))
 			}
 		})
 	}

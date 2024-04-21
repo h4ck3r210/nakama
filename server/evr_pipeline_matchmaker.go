@@ -61,6 +61,7 @@ func (p *EvrPipeline) authorizeMatchmaking(ctx context.Context, logger *zap.Logg
 			logger.Warn("Failed to find older session to disconnect", zap.String("other_sid", foundSessionID.String()))
 			continue
 		}
+		// Send an error
 		fs.Close("New session started", runtime.PresenceReasonDisconnect)
 	}
 
@@ -102,16 +103,20 @@ func (p *EvrPipeline) authorizeMatchmaking(ctx context.Context, logger *zap.Logg
 	return true, nil
 }
 func (p *EvrPipeline) matchmakingLabelFromFindRequest(ctx context.Context, session *sessionWS, request *evr.LobbyFindSessionRequest) (*EvrMatchState, error) {
+	// Get the EvrID from the context (ignoring the request)
+	evrID, ok := ctx.Value(ctxEvrIDKey{}).(evr.EvrId)
+	if !ok {
+		return nil, fmt.Errorf("failed to get evrID from context")
+	}
+
 	// If the channel is nil, use the players profile channel
 	channel := request.Channel
 	if channel == uuid.Nil {
-		profile := p.profileRegistry.GetProfile(session.userID)
-		if profile == nil {
+		profile, ok := p.profileRegistry.Load(session.userID, evrID)
+		if !ok {
 			return nil, status.Errorf(codes.Internal, "Failed to get players profile")
 		}
-		profile.RLock()
 		channel = profile.GetChannel()
-		profile.RUnlock()
 	}
 
 	// Set the channels this player is allowed to matchmake/create a match on.
@@ -146,6 +151,13 @@ func (p *EvrPipeline) matchmakingLabelFromFindRequest(ctx context.Context, sessi
 // lobbyFindSessionRequest is a message requesting to find a public session to join.
 func (p *EvrPipeline) lobbyFindSessionRequest(ctx context.Context, logger *zap.Logger, session *sessionWS, in evr.Message) (err error) {
 	request := in.(*evr.LobbyFindSessionRequest)
+	metricsTags := map[string]string{
+		"mode":     request.Mode.String(),
+		"channel":  request.Channel.String(),
+		"level":    request.Level.String(),
+		"team_idx": strconv.FormatInt(int64(request.TeamIndex), 10),
+	}
+	p.metrics.CustomCounter("lobbyfindsession_active", metricsTags, 1)
 	loginSessionID := request.LoginSessionID
 	groups, priorities, err := p.GetGuildPriorityList(ctx, session.userID)
 	if err != nil {
@@ -209,7 +221,7 @@ func (p *EvrPipeline) lobbyFindSessionRequest(ctx context.Context, logger *zap.L
 func (p *EvrPipeline) MatchSpectateStreamLoop(session *sessionWS, msession *MatchmakingSession, skipDelay bool, create bool) error {
 	logger := msession.Logger
 	ctx := msession.Context()
-
+	p.metrics.CustomCounter("spectatestream_active", msession.metricsTags(), 1)
 	// Create a ticker to spectate
 	spectateInterval := time.Duration(10) * time.Second
 
@@ -250,8 +262,10 @@ func (p *EvrPipeline) MatchSpectateStreamLoop(session *sessionWS, msession *Matc
 		case <-ctx.Done():
 			return nil
 		case msession.MatchJoinCh <- foundMatch:
+			p.metrics.CustomCounter("spectatestream_found", msession.metricsTags(), 1)
 			logger.Debug("Spectating match", zap.String("mid", foundMatch.MatchID))
 		case <-time.After(3 * time.Second):
+			p.metrics.CustomCounter("spectatestream_join_timeout", msession.metricsTags(), 1)
 			logger.Warn("Failed to spectate match", zap.String("mid", foundMatch.MatchID))
 		}
 		<-time.After(spectateInterval)
@@ -318,12 +332,14 @@ func (p *EvrPipeline) MatchBackfillLoop(session *sessionWS, msession *Matchmakin
 		default:
 		}
 		logger.Debug("Attempting to backfill match", zap.String("mid", foundMatch.MatchID))
+		p.metrics.CustomCounter("match_backfill_found", msession.metricsTags(), 1)
 		msession.MatchJoinCh <- foundMatch
 
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(3 * time.Second):
+			p.metrics.CustomCounter("match_backfill_join_timeout", msession.metricsTags(), 1)
 			logger.Warn("Failed to backfill match", zap.String("mid", foundMatch.MatchID))
 		}
 		// Continue to loop until the context is done
@@ -336,6 +352,7 @@ func (p *EvrPipeline) MatchCreateLoop(session *sessionWS, msession *MatchmakingS
 	logger := msession.Logger
 	// set a timeout
 	//stageTimer := time.NewTimer(pruneDelay)
+	p.metrics.CustomCounter("match_create_active", msession.metricsTags(), 1)
 	for {
 
 		select {
@@ -361,13 +378,15 @@ func (p *EvrPipeline) MatchCreateLoop(session *sessionWS, msession *MatchmakingS
 			case <-ctx.Done():
 				return nil
 			case msession.MatchJoinCh <- foundMatch:
+				p.metrics.CustomCounter("match_create_join_active", msession.metricsTags(), 1)
 				logger.Debug("Joining match", zap.String("mid", foundMatch.MatchID))
 			case <-time.After(3 * time.Second):
+				p.metrics.CustomCounter("make_create_create_join_timeout", msession.metricsTags(), 1)
 				msession.Cancel(fmt.Errorf("failed to join match"))
 			}
 			// Keep trying until the context is done
 		case codes.NotFound, codes.ResourceExhausted, codes.Unavailable:
-
+			p.metrics.CustomCounter("create_unavailable", msession.metricsTags(), 1)
 		default:
 			return msession.Cancel(err)
 		}
@@ -405,7 +424,7 @@ func (p *EvrPipeline) MatchFind(parentCtx context.Context, logger *zap.Logger, s
 		logger.Error("Failed to create matchmaking session", zap.Error(err))
 		return err
 	}
-
+	p.metrics.CustomCounter("match_find_active", msession.metricsTags(), 1)
 	// Load the user's matchmaking config
 
 	config, err := p.matchmakingRegistry.LoadMatchmakingSettings(msession.Ctx, session.userID.String())
@@ -413,31 +432,31 @@ func (p *EvrPipeline) MatchFind(parentCtx context.Context, logger *zap.Logger, s
 		logger.Error("Failed to load matchmaking config", zap.Error(err))
 	}
 
-	matchID := ""
+	matchToken := ""
 	// Check for a direct match first
-	if config.NextMatchID != "" {
-		matchID = config.NextMatchID
+	if config.NextMatchToken != "" {
+		matchToken = config.NextMatchToken.String()
 	}
 
-	config.NextMatchID = ""
+	config.NextMatchToken = ""
 	err = p.matchmakingRegistry.storeMatchmakingConfig(msession.Ctx, config, session.userID.String())
 	if err != nil {
 		logger.Error("Failed to save matchmaking config", zap.Error(err))
 	}
 
-	if matchID != "" {
-		logger.Debug("Attempting to join match from settings", zap.String("mid", matchID))
-		match, _, err := p.matchRegistry.GetMatch(msession.Ctx, matchID)
+	if matchToken != "" {
+		logger.Debug("Attempting to join match from settings", zap.String("mid", matchToken))
+		match, _, err := p.matchRegistry.GetMatch(msession.Ctx, matchToken)
 		if err != nil {
 			logger.Error("Failed to get match", zap.Error(err))
 		} else {
 			if match == nil {
-				logger.Warn("Match not found", zap.String("mid", matchID))
+				logger.Warn("Match not found", zap.String("mid", matchToken))
 			} else {
-				p.metrics.CustomCounter("matchmaking_direct_match", map[string]string{}, 1)
+				p.metrics.CustomCounter("match_next_join", map[string]string{}, 1)
 				// Join the match
 				msession.MatchJoinCh <- FoundMatch{
-					MatchID:   matchID,
+					MatchID:   matchToken,
 					Query:     "",
 					TeamIndex: TeamIndex(evr.TeamUnassigned),
 				}
@@ -539,14 +558,17 @@ func (p *EvrPipeline) lobbyPingResponse(ctx context.Context, logger *zap.Logger,
 }
 
 func (p *EvrPipeline) GetGuildPriorityList(ctx context.Context, userID uuid.UUID) (all []uuid.UUID, selected []uuid.UUID, err error) {
+	evrID, ok := ctx.Value(ctxEvrIDKey{}).(evr.EvrId)
+	if !ok {
+		return nil, nil, fmt.Errorf("failed to get evrID from context")
+	}
 
-	profile := p.profileRegistry.GetProfile(userID)
-	if profile == nil {
+	profile, ok := p.profileRegistry.Load(userID, evrID)
+	if !ok {
 		return nil, nil, status.Errorf(codes.Internal, "Failed to get players profile")
 	}
-	profile.RLock()
+
 	currentChannel := profile.GetChannel()
-	profile.RUnlock()
 
 	// Get the guild priority from the context
 	groups, err := p.discordRegistry.GetGuildGroups(ctx, userID)
@@ -588,13 +610,21 @@ func (p *EvrPipeline) GetGuildPriorityList(ctx context.Context, userID uuid.UUID
 			}
 		}
 	}
-
+	p.logger.Debug("guild priorites", zap.Any("prioritized", guildPriority), zap.Any("all", groupIDs))
 	return groupIDs, selected, nil
 }
 
 // lobbyCreateSessionRequest is a request to create a new session.
 func (p *EvrPipeline) lobbyCreateSessionRequest(ctx context.Context, logger *zap.Logger, session *sessionWS, in evr.Message) error {
 	request := in.(*evr.LobbyCreateSessionRequest)
+	metricsTags := map[string]string{
+		"type":     strconv.FormatInt(int64(request.LobbyType), 10),
+		"mode":     request.Mode.String(),
+		"channel":  request.Channel.String(),
+		"level":    request.Level.String(),
+		"team_idx": strconv.FormatInt(int64(request.TeamIndex), 10),
+	}
+	p.metrics.CustomCounter("lobbycreatesession_active", metricsTags, 1)
 	loginSessionID := request.LoginSessionID
 	groups, priorities, err := p.GetGuildPriorityList(ctx, session.userID)
 	if err != nil {
@@ -691,7 +721,7 @@ func (p *EvrPipeline) lobbyCreateSessionRequest(ctx context.Context, logger *zap
 		if err != nil {
 			return result.SendErrorToSession(session, status.Errorf(codes.Internal, "Failed to create matchmaking session: %v", err))
 		}
-
+		p.metrics.CustomCounter("create_active", map[string]string{}, 1)
 		err = p.MatchCreateLoop(session, msession, 5*time.Minute)
 		if err != nil {
 			return result.SendErrorToSession(session, err)
@@ -705,6 +735,10 @@ func (p *EvrPipeline) lobbyCreateSessionRequest(ctx context.Context, logger *zap
 // lobbyJoinSessionRequest is a request to join a specific existing session.
 func (p *EvrPipeline) lobbyJoinSessionRequest(ctx context.Context, logger *zap.Logger, session *sessionWS, in evr.Message) error {
 	request := in.(*evr.LobbyJoinSessionRequest)
+	metricsTags := map[string]string{
+		"team_idx": strconv.FormatInt(int64(request.TeamIndex), 10),
+	}
+	p.metrics.CustomCounter("lobbyjoinsession_active", metricsTags, 1)
 	loginSessionID := request.LoginSessionID
 	// Make sure the match exists
 	matchId := request.LobbyId.String() + "." + p.node
@@ -751,6 +785,7 @@ func (p *EvrPipeline) lobbyJoinSessionRequest(ctx context.Context, logger *zap.L
 	}
 
 	// Join the match
+
 	if err = p.JoinEvrMatch(ctx, logger, session, "", matchId, int(request.TeamIndex)); err != nil {
 		return NewMatchmakingResult(logger, 0xFFFFFFFFFFFFFFFF, request.LobbyId).SendErrorToSession(session, status.Errorf(codes.NotFound, err.Error()))
 	}

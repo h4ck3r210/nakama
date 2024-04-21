@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,8 @@ type DiscordAppBot struct {
 
 	discordRegistry DiscordRegistry
 	dg              *discordgo.Session
+
+	userID string // Nakama UserID of the bot
 }
 
 func NewDiscordAppBot(nk runtime.NakamaModule, logger runtime.Logger, metrics Metrics, pipeline *Pipeline, config Config, discordRegistry DiscordRegistry, dg *discordgo.Session) *DiscordAppBot {
@@ -84,28 +87,28 @@ type EvrIdLogins struct {
 
 var (
 	vrmlGroupChoices = []*discordgo.ApplicationCommandOptionChoice{
-		{Name: "Preseason", Value: "Preseason"},
-		{Name: "VRML S1 Champion", Value: "VRML S1 Champion"},
-		{Name: "VRML S1 Finalist", Value: "VRML S1 Finalist"},
-		{Name: "VRML S1", Value: "VRML S1"},
-		{Name: "VRML S2 Champion", Value: "VRML S2 Champion"},
-		{Name: "VRML S2 Finalist", Value: "VRML S2 Finalist"},
-		{Name: "VRML S2", Value: "VRML S2"},
-		{Name: "VRML S3 Champion", Value: "VRML S3 Champion"},
-		{Name: "VRML S3 Finalist", Value: "VRML S3 Finalist"},
-		{Name: "VRML S3", Value: "VRML S3"},
-		{Name: "VRML S4", Value: "VRML S4"},
-		{Name: "VRML S4 Finalist", Value: "VRML S4 Finalist"},
-		{Name: "VRML S4 Champion", Value: "VRML S4 Champion"},
-		{Name: "VRML S5", Value: "VRML S5"},
-		{Name: "VRML S5 Finalist", Value: "VRML S5 Finalist"},
-		{Name: "VRML S5 Champion", Value: "VRML S5 Champion"},
-		{Name: "VRML S6", Value: "VRML S6"},
-		{Name: "VRML S6 Finalist", Value: "VRML S6 Finalist"},
-		{Name: "VRML S6 Champion", Value: "VRML S6 Champion"},
-		{Name: "VRML S7", Value: "VRML S7"},
-		{Name: "VRML S7 Finalist", Value: "VRML S7 Finalist"},
-		{Name: "VRML S7 Champion", Value: "VRML S7 Champion"},
+		{Name: "VRML Preseason", Value: "VRML Season Preseason"},
+		{Name: "VRML S1 Champion", Value: "VRML Season 1 Champion"},
+		{Name: "VRML S1 Finalist", Value: "VRML Season 1 Finalist"},
+		{Name: "VRML S1", Value: "VRML Season 1"},
+		{Name: "VRML S2 Champion", Value: "VRML Season 2 Champion"},
+		{Name: "VRML S2 Finalist", Value: "VRML Season 2 Finalist"},
+		{Name: "VRML S2", Value: "VRML Season 2"},
+		{Name: "VRML S3 Champion", Value: "VRML Season 3 Champion"},
+		{Name: "VRML S3 Finalist", Value: "VRML Season 3 Finalist"},
+		{Name: "VRML S3", Value: "VRML Season 3"},
+		{Name: "VRML S4", Value: "VRML Season 4"},
+		{Name: "VRML S4 Finalist", Value: "VRML Season 4 Finalist"},
+		{Name: "VRML S4 Champion", Value: "VRML Season 4 Champion"},
+		{Name: "VRML S5", Value: "VRML Season 5"},
+		{Name: "VRML S5 Finalist", Value: "VRML Season 5 Finalist"},
+		{Name: "VRML S5 Champion", Value: "VRML Season 5 Champion"},
+		{Name: "VRML S6", Value: "VRML Season 6"},
+		{Name: "VRML S6 Finalist", Value: "VRML Season 6 Finalist"},
+		{Name: "VRML S6 Champion", Value: "VRML Season 6 Champion"},
+		{Name: "VRML S7", Value: "VRML Season 7"},
+		{Name: "VRML S7 Finalist", Value: "VRML Season 7 Finalist"},
+		{Name: "VRML S7 Champion", Value: "VRML Season 7 Champion"},
 	}
 
 	groupRegex = regexp.MustCompile("^[a-z0-9]+$")
@@ -365,11 +368,11 @@ func (d *DiscordAppBot) InitializeDiscordBot() error {
 
 	bot.AddHandler(func(s *discordgo.Session, m *discordgo.Ready) {
 		// Create a user for the bot based on it's discord profile
-		_, _, _, err := nk.AuthenticateCustom(ctx, m.User.ID, s.State.User.Username, true)
+		userID, _, _, err := nk.AuthenticateCustom(ctx, m.User.ID, s.State.User.Username, true)
 		if err != nil {
 			logger.Error("Error creating discordbot user: %s", err)
 		}
-
+		d.userID = userID
 		// Synchronize the guilds with nakama groups
 		logger.Info("Bot is in %d guilds", len(s.State.Guilds))
 		for _, g := range m.Guilds {
@@ -380,7 +383,7 @@ func (d *DiscordAppBot) InitializeDiscordBot() error {
 			}
 
 			if err := d.discordRegistry.SynchronizeGroup(ctx, g); err != nil {
-				logger.Error("Error synchronizing group: %w", err)
+				logger.Error("Error synchronizing group: %s", err.Error())
 				return
 			}
 		}
@@ -485,7 +488,7 @@ func (d *DiscordAppBot) InitializeDiscordBot() error {
 
 		if groupId, found := d.discordRegistry.Get(m.GuildID); found {
 			if user, err := d.discordRegistry.GetUserIdByDiscordId(ctx, m.User.ID, true); err == nil {
-				nk.GroupUsersKick(ctx, SystemUserId, groupId, []string{user.String()})
+				nk.GroupUsersKick(ctx, SystemUserID, groupId, []string{user.String()})
 			}
 		}
 	})
@@ -505,7 +508,7 @@ func (d *DiscordAppBot) InitializeDiscordBot() error {
 
 		if groupId, found := d.discordRegistry.Get(m.GuildID); found {
 			if user, err := d.discordRegistry.GetUserIdByDiscordId(ctx, m.User.ID, true); err == nil {
-				_ = nk.GroupUserLeave(ctx, SystemUserId, groupId, user.String())
+				_ = nk.GroupUserLeave(ctx, SystemUserID, groupId, user.String())
 			}
 		}
 	})
@@ -593,18 +596,19 @@ func (d *DiscordAppBot) RegisterSlashCommands() error {
 
 	// Build a map of VRML group names to their group IDs
 	vrmlGroups := make(map[string]string)
-	for _, group := range vrmlGroupChoices {
+	for _, choice := range vrmlGroupChoices {
 		// Look up the group by name
-		groups, _, err := nk.GroupsList(ctx, group.Name, "", nil, nil, 1, "")
+		groupName := choice.Value.(string)
+		groups, _, err := nk.GroupsList(ctx, groupName, "", nil, nil, 1, "")
 		if err != nil {
 			logger.Error("Error looking up group: %s", err.Error())
 			continue
 		}
 		if len(groups) == 0 {
-			logger.Error("Group not found: %s", group.Name)
+			logger.Error("Group not found: %s", groupName)
 			continue
 		}
-		vrmlGroups[group.Name] = groups[0].Id
+		vrmlGroups[groupName] = groups[0].Id
 	}
 
 	commandHandlers := map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
@@ -613,6 +617,8 @@ func (d *DiscordAppBot) RegisterSlashCommands() error {
 			options := i.ApplicationCommandData().Options
 			token := options[0].StringValue()
 			symbol := evr.ToSymbol(token)
+			bytes := binary.LittleEndian.AppendUint64([]byte{}, uint64(symbol))
+
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
@@ -643,8 +649,8 @@ func (d *DiscordAppBot) RegisterSlashCommands() error {
 									Inline: false,
 								},
 								{
-									Name:   "hex byte array",
-									Value:  fmt.Sprintf("%#v", []byte(symbol.Token())),
+									Name:   "LE bytes",
+									Value:  fmt.Sprintf("%#v", bytes),
 									Inline: false,
 								},
 							},
@@ -1002,8 +1008,8 @@ func (d *DiscordAppBot) RegisterSlashCommands() error {
 				// Send it to the channel
 				s.ChannelMessageSend(badgeChannel, basicMessage)
 
-				// Tell teh user
-				content = "Requesting badges for:" + strings.Join(badgeNames, ", ")
+				// Tell the user
+				content = "Requesting badges for:" + strings.Join(badgeNames, ", "+". Please be patient as it may take some time.")
 				// Send a message to the user
 				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 					Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -1045,7 +1051,7 @@ func (d *DiscordAppBot) RegisterSlashCommands() error {
 				}
 
 				s.ChannelMessageSendComplex(badgeChannel, &discordgo.MessageSend{
-					Content:    fmt.Sprintf("<@%s> (`%s`) is requesting the following badges: %s", user.ID, user.Username),
+					Content:    fmt.Sprintf("<@%s> (`%s`) is requesting the following badges: %s", user.ID, user.Username, strings.Join(badgeNames, ", ")),
 					Components: rows,
 				})
 
@@ -1197,7 +1203,7 @@ func (d *DiscordAppBot) RegisterSlashCommands() error {
 				query := "+group_id:" + matchmakingConfig.GroupID
 				var members []string
 
-				idxobjs, err := nk.StorageIndexList(ctx, SystemUserId, ActivePartyGroupIndex, query, 1000)
+				idxobjs, err := nk.StorageIndexList(ctx, SystemUserID, ActivePartyGroupIndex, query, 1000)
 				if err != nil {
 					logger.Error("Failed to list party members", zap.Error(err))
 					return

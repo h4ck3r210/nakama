@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	MatchJoinGracePeriod = 5 * time.Second
+	MatchJoinGracePeriod = 3 * time.Second
 )
 
 var (
@@ -218,7 +218,7 @@ func (p *EvrPipeline) MatchMake(session *sessionWS, msession *MatchmakingSession
 		},
 	}
 	// Load the global matchmaking config
-	gconfig, err := p.matchmakingRegistry.LoadMatchmakingSettings(ctx, SystemUserId)
+	gconfig, err := p.matchmakingRegistry.LoadMatchmakingSettings(ctx, SystemUserID)
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "Failed to load global matchmaking config: %v", err)
 	}
@@ -235,7 +235,7 @@ func (p *EvrPipeline) MatchMake(session *sessionWS, msession *MatchmakingSession
 
 	if config.GroupID != "" {
 		partyRegistry := session.pipeline.partyRegistry
-		ph, err := joinPartyGroup(logger, partyRegistry, userID, sessionID.String(), session.Username(), p.node, config.GroupID)
+		ph, err := p.joinPartyGroup(logger, partyRegistry, userID, sessionID.String(), session.Username(), p.node, config.GroupID)
 		if err != nil {
 			logger.Warn("Failed to join party group", zap.String("group_id", config.GroupID), zap.Error(err))
 		} else {
@@ -275,6 +275,13 @@ func (p *EvrPipeline) MatchMake(session *sessionWS, msession *MatchmakingSession
 	if !ok {
 		return "", status.Errorf(codes.Internal, "Failed to track user: %v", err)
 	}
+	tags := map[string]string{
+		"type":  msession.Label.LobbyType.String(),
+		"mode":  msession.Label.Mode.String(),
+		"level": msession.Label.Level.String(),
+	}
+
+	p.metrics.CustomCounter("matchmaker_tickets", tags, 1)
 	// Add the user to the matchmaker
 	ticket, _, err = session.matchmaker.Add(ctx, presences, sessionID.String(), pID, query, minCount, maxCount, countMultiple, stringProps, numericProps)
 	if err != nil {
@@ -284,7 +291,7 @@ func (p *EvrPipeline) MatchMake(session *sessionWS, msession *MatchmakingSession
 	return ticket, nil
 }
 
-func joinPartyGroup(logger *zap.Logger, partyRegistry PartyRegistry, userID, sessionID, username, node, groupID string) (*PartyHandler, error) {
+func (p *EvrPipeline) joinPartyGroup(logger *zap.Logger, partyRegistry PartyRegistry, userID, sessionID, username, node, groupID string) (*PartyHandler, error) {
 	// Attempt to join the party
 	userPresence := &rtapi.UserPresence{
 		UserId:    userID,
@@ -316,11 +323,13 @@ func joinPartyGroup(logger *zap.Logger, partyRegistry PartyRegistry, userID, ses
 			partyRegistry.Join(partyID, presence)
 			return ph, nil
 		} else {
+			p.metrics.CustomCounter("partyregistry_error_party_full", nil, 1)
 			logger.Warn("Party is full", zap.String("party_id", partyID.String()))
 			return ph, status.Errorf(codes.ResourceExhausted, "Party is full")
 		}
 	} else {
 		// Create the party
+		p.metrics.CustomCounter("partyregistry_create", nil, 1)
 		ph = partyRegistry.Create(true, 8, userPresence)
 		return ph, nil
 	}
@@ -559,6 +568,13 @@ func (p *EvrPipeline) MatchCreate(ctx context.Context, session *sessionWS, msess
 	parkingMatchId := fmt.Sprintf("%s.%s", match.MatchID, p.node)
 
 	label.SpawnedBy = session.UserID().String()
+
+	// Prepare the match
+	_, err = SignalMatch(ctx, p.matchRegistry, parkingMatchId, SignalPrepareSession, label)
+	if err != nil {
+		return "", fmt.Errorf("failed to load level: %v", err)
+	}
+
 	// Instruct the server to load the level
 	_, err = SignalMatch(ctx, p.matchRegistry, parkingMatchId, SignalStartSession, label)
 	if err != nil {
@@ -615,21 +631,22 @@ func (p *EvrPipeline) JoinEvrMatch(ctx context.Context, logger *zap.Logger, sess
 
 	// If this is a NoVR user, give the profile's displayName a bot suffix
 	// Get the NoVR key from context
-	novr, ok := ctx.Value(ctxNoVRKey{}).(bool)
-	if !ok {
-		novr = false
-	}
-	if novr {
-		botsuffix := " d[ o_0 ]b"
-		// Extend the display name with the bot suffix
-		displayName = fmt.Sprintf("%s%21s", displayName, botsuffix)
+	if novr, ok := ctx.Value(ctxNoVRKey{}).(bool); ok && novr {
+		displayName = "d[o_0]b " + displayName
 	}
 
-	// right align the bot suffix to 30 characters
 	// Set the profile's display name.
-	profile := p.profileRegistry.GetProfile(session.UserID())
-	if profile != nil {
-		profile.UpdateDisplayName(displayName)
+	profile, found := p.profileRegistry.Load(session.UserID(), evrID)
+	if !found {
+		defer session.Close("profile not found", runtime.PresenceReasonUnknown)
+		return fmt.Errorf("profile not found: %s", session.UserID())
+	}
+
+	profile.UpdateDisplayName(displayName)
+	// Add the user's profile to the cache (by EvrID)
+	err = p.profileRegistry.Cache(profile.GetServer())
+	if err != nil {
+		logger.Warn("Failed to add profile to cache", zap.Error(err))
 	}
 
 	// TODO FIXME Get the party id if the player is in a party
@@ -647,7 +664,7 @@ func (p *EvrPipeline) JoinEvrMatch(ctx context.Context, logger *zap.Logger, sess
 		SessionID:     session.id,
 		Username:      session.Username(),
 		DisplayName:   displayName,
-		EvrId:         evrID,
+		EvrID:         evrID,
 		PlayerSession: uuid.Must(uuid.NewV4()),
 		TeamIndex:     int(teamIndex),
 		DiscordID:     discordID,
@@ -680,11 +697,6 @@ func (p *EvrPipeline) JoinEvrMatch(ctx context.Context, logger *zap.Logger, sess
 		}
 	}
 
-	// Add the user's profile to the cache
-	err = p.profileRegistry.SetProfileByEvrID(evrID, profile.GetServer())
-	if err != nil {
-		logger.Warn("Failed to set profile by match id", zap.Error(err))
-	}
 	if isNew {
 		// Trigger the MatchJoin event.
 		stream := PresenceStream{Mode: StreamModeMatchAuthoritative, Subject: matchID, Label: p.node}

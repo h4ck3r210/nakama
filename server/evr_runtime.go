@@ -4,9 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 
 	"github.com/heroiclabs/nakama-common/runtime"
-	"go.uber.org/zap"
 
 	_ "google.golang.org/protobuf/proto"
 )
@@ -19,40 +19,11 @@ var (
 	}
 )
 
-// FIXME Figure out how to get this passed to the pipeline without having to do this.
-
-type EvrRuntime struct{}
-
-func NewEvrRuntime(logger *zap.Logger, config Config, db *sql.DB, matchRegistry MatchRegistry, router MessageRouter) *EvrRuntime {
-	/*
-		matchProvider := NewMatchProvider()
-
-		matchProvider.RegisterCreateFn("go",
-			func(ctx context.Context, logger *zap.Logger, id uuid.UUID, node string, stopped *atomic.Bool,
-				name string) (RuntimeMatchCore, error) {
-				match, err := newEvrLobby(context.Background(), NewRuntimeGoLogger(logger), nil, nil)
-				if err != nil {
-					return nil, err
-				}
-
-				rmc, err := NewRuntimeGoMatchCore(logger, "module", matchRegistry, router, id, "node", "",
-					stopped, nil, map[string]string{}, nil, match)
-				if err != nil {
-					return nil, err
-				}
-				return rmc, nil
-			},
-		)
-	*/
-
-	// This is a hack around the issues with go plugins.
-	// This mimics the loading of a nakama plugin.
-	// TODO continue to move code out of the internals and into this runtime.
-
-	//fn := f.(func(context.Context, runtime.Logger, *sql.DB, runtime.NakamaModule, runtime.Initializer) error)
-
-	return &EvrRuntime{}
-}
+const (
+	GroupGlobalDevelopers = "Global Developers"
+	GroupGlobalModerators = "Global Moderators"
+	GroupGlobalTesters    = "Global Testers"
+)
 
 func InitializeEvrRuntimeModule(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, initializer runtime.Initializer) (err error) {
 
@@ -62,6 +33,7 @@ func InitializeEvrRuntimeModule(ctx context.Context, logger runtime.Logger, db *
 		"link/usernamedevice":  LinkUserIdDeviceRpc,
 		"signin/discord":       DiscordSignInRpc,
 		"match":                MatchRpc,
+		"match/prepare":        PrepareMatchRPC,
 		"link":                 LinkingAppRpc,
 		"evr/servicestatus":    ServiceStatusRpc,
 		"importloadouts":       ImportLoadoutsRpc,
@@ -72,8 +44,7 @@ func InitializeEvrRuntimeModule(ctx context.Context, logger runtime.Logger, db *
 
 	for name, rpc := range rpcs {
 		if err = initializer.RegisterRpc(name, rpc); err != nil {
-			logger.Error("Unable to register: %v", err)
-			return
+			return fmt.Errorf("unable to register %s: %v", name, err)
 		}
 	}
 
@@ -81,8 +52,7 @@ func InitializeEvrRuntimeModule(ctx context.Context, logger runtime.Logger, db *
 
 	// Create the core groups
 	if err := createCoreGroups(ctx, logger, db, nk, initializer); err != nil {
-		logger.Error("Unable to create core groups: %v", err)
-		return err
+		return fmt.Errorf("unable to create core groups: %v", err)
 	}
 
 	// Register the "matchmaking" handler
@@ -94,8 +64,7 @@ func InitializeEvrRuntimeModule(ctx context.Context, logger runtime.Logger, db *
 
 	// Register RPC for /api service.
 	if err := initializer.RegisterRpc("evr/api", EvrApiHttpHandler); err != nil {
-		logger.Error("Unable to register: %v", err)
-		return err
+		return fmt.Errorf("unable to register /evr/api service: %v", err)
 	}
 
 	logger.Info("Initialized runtime module.")
@@ -104,15 +73,15 @@ func InitializeEvrRuntimeModule(ctx context.Context, logger runtime.Logger, db *
 
 func createCoreGroups(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, initializer runtime.Initializer) error {
 	// Create user for use by the discord bot (and core group ownership)
-	userId, _, _, err := nk.AuthenticateDevice(ctx, SystemUserId, "discordbot", true)
+	userId, _, _, err := nk.AuthenticateDevice(ctx, SystemUserID, "discordbot", true)
 	if err != nil {
 		logger.WithField("err", err).Error("Error creating discordbot user: %v", err)
 	}
 
 	coreGroups := []string{
-		"Global Developers",
-		"Global Moderators",
-		"Global Testers",
+		GroupGlobalDevelopers,
+		GroupGlobalModerators,
+		GroupGlobalTesters,
 	}
 
 	for _, name := range coreGroups {
@@ -162,10 +131,15 @@ func createCoreGroups(ctx context.Context, logger runtime.Logger, db *sql.DB, nk
 			logger.WithField("err", err).Error("Group list error: %v", err)
 		}
 		if len(groups) == 0 {
-			_, err = nk.GroupCreate(ctx, userId, name, userId, "en", "VRML Badge Entitlement", "", false, map[string]interface{}{}, 1000)
+			_, err = nk.GroupCreate(ctx, userId, name, userId, "entitlement", "VRML Badge Entitlement", "", false, map[string]interface{}{}, 1000)
 			if err != nil {
 				logger.WithField("err", err).Error("Group create error: %v", err)
 			}
+			continue
+		}
+		group := groups[0]
+		if err := nk.GroupUpdate(ctx, group.Id, userId, name, userId, "entitlement", "VRML Badge Entitlement", "", false, map[string]interface{}{}, 1000); err != nil {
+			logger.WithField("err", err).Error("Group update error: %v", err)
 		}
 	}
 	return nil

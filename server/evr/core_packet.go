@@ -49,7 +49,7 @@ var (
 		0x6c8f16cd9f8964c5: (*ChannelInfoResponse)(nil),
 		0x6d4de3650ee3110e: (*LobbySessionSuccessv4)(nil),
 		0x6d4de3650ee3110f: (*LobbySessionSuccessv5)(nil),
-		0x6d54a19a3ff24415: (*UpdateProfile)(nil),
+		0x6d54a19a3ff24415: (*UpdateClientProfile)(nil),
 		0x7777777777770000: (*BroadcasterStartSession)(nil),
 		0x7777777777770100: (*BroadcasterSessionStarted)(nil),
 		0x7777777777770200: (*BroadcasterSessionEnded)(nil),
@@ -259,7 +259,7 @@ func ParsePacket(data []byte) ([]Message, error) {
 		buf := bytes.NewBuffer(b)
 		// Verify packet length.
 		if buf.Len() < 16 {
-			return nil, errors.Join(ErrInvalidPacket, fmt.Errorf("invalid packet"))
+			return nil, errors.Join(ErrInvalidPacket, ErrInvalidPacket)
 		}
 		// Read the message type and data length.
 		sym := dUint64(buf.Next(8))
